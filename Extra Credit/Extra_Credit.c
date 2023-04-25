@@ -1,152 +1,228 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-#define CACHE_SIZE 32
-#define BLOCK_SIZE 4
+// Cache line struct
+typedef struct cache_line {
+    int valid;
+    int tag;
+    time_t access_time;
+} cache_line;
 
+// Cache struct
 typedef struct cache {
-    int size;   // Size of the cache
-    int assoc;  // Associativity of the cache
-    int num_sets;   // Number of sets in the cache
-    int block_size; // Size of a block in the cache
-    int rp;     // Replacement policy (0 for LRU, 1 for Random)
-    int hit;    // Number of cache hits
-    int miss;   // Number of cache misses
-    int **tag;  // Tag array
-    int **valid;    // Valid array
-    char **data;    // Data array
-    int *lru;   // LRU array (only used for LRU replacement policy)
-} Cache;
+    int size;
+    int line_size;
+    int num_lines;
+    cache_line* lines;
+} cache;
 
-// Helper function to convert hexadecimal strings to integers
-int hex_to_int(char *hex) {
-    int result = 0;
-    int len = strlen(hex);
+// Hash function for direct-mapped cache
+int direct_map_hash(int address, int num_lines) {
+    return address % num_lines;
+}
+
+// Function to find a cache line in a set-associative cache
+int find_cache_line(cache* c, int set_index, int tag) {
     int i;
-    for (i = 0; i < len; i++) {
-        char c = hex[i];
-        int digit;
-        if (c >= '0' && c <= '9') {
-            digit = c - '0';
-        } else if (c >= 'a' && c <= 'f') {
-            digit = c - 'a' + 10;
-        } else if (c >= 'A' && c <= 'F') {
-            digit = c - 'A' + 10;
-        } else {
-            // Invalid character
-            return -1;
+    for (i = 0; i < c->line_size; i++) {
+        int index = set_index * c->line_size + i;
+        cache_line line = c->lines[index];
+        if (line.valid && line.tag == tag) {
+            return index;
         }
-        result = result * 16 + digit;
     }
-    return result;
+    return -1;
 }
 
-void init_cache(Cache *cache, int assoc, int rp) {
-    int i, j;
-    cache->assoc = assoc;
-    cache->num_sets = cache->size / (assoc * cache->block_size);
-    cache->rp = rp;
-    cache->hit = 0;
-    cache->miss = 0;
-    cache->tag = (int **) calloc(cache->num_sets, sizeof(int *));
-    cache->valid = (int **) calloc(cache->num_sets, sizeof(int *));
-    cache->data = (char **) calloc(cache->num_sets, sizeof(char *));
-    if (rp == 0) {
-        cache->lru = (int *) calloc(cache->num_sets, sizeof(int));
-    }
-    for (i = 0; i < cache->num_sets; i++) {
-        cache->tag[i] = (int *) calloc(assoc, sizeof(int));
-        cache->valid[i] = (int *) calloc(assoc, sizeof(int));
-        cache->data[i] = (char *) calloc(cache->block_size * assoc, sizeof(char));
-    }
-    if (rp == 0) {
-        for (i = 0; i < cache->num_sets; i++) {
-            memset(cache->lru, 0, cache->num_sets * sizeof(int));
+// Function to find a cache line in a fully associative cache
+int find_cache_line_fully(cache* c, int tag) {
+    int i;
+    for (i = 0; i < c->num_lines; i++) {
+        cache_line line = c->lines[i];
+        if (line.valid && line.tag == tag) {
+            return i;
         }
+    }
+    return -1;
+}
+
+// Function to update access time of cache line
+void update_access_time(cache* c, int index) {
+    c->lines[index].access_time = time(NULL);
+}
+
+// Function to evict least-recently used line from set-associative cache
+void evict_lru_line(cache* c, int set_index) {
+    int i, oldest_index;
+    time_t oldest_time = time(NULL);
+    for (i = 0; i < c->line_size; i++) {
+        int index = set_index * c->line_size + i;
+        cache_line line = c->lines[index];
+        if (line.valid && line.access_time < oldest_time) {
+            oldest_index = index;
+            oldest_time = line.access_time;
+        }
+    }
+    c->lines[oldest_index].valid = 0;
+}
+
+// Function to evict a random line from set-associative cache
+void evict_random_line(cache* c, int set_index) {
+    int random_index = set_index * c->line_size + (rand() % c->line_size);
+    c->lines[random_index].valid = 0;
+}
+
+// Function to evict least-recently used line from fully associative cache
+void evict_lru_line_fully(cache* c) {
+    int i, oldest_index;
+    time_t oldest_time = time(NULL);
+    for (i = 0; i < c->num_lines; i++) {
+        cache_line line = c->lines[i];
+        if (line.valid && line.access_time < oldest_time) {
+            oldest_index = i;
+            oldest_time = line.access_time;
+        }
+    }
+    c->lines[oldest_index].valid = 0;
+}
+
+// Function to evict a random line from fully associative cache
+void evict_random_line_fully(cache* c) {
+    int random_index = rand() % c->num_lines;
+    c->lines[random_index].valid = 0;
+}
+
+// Function to access memory address in direct-mapped cache
+void access_direct_map(cache* c, int address) {
+    int line_index = direct_map_hash(address, c->num_lines);
+    cache_line line = c->lines[line_index];
+    if (line.valid && line.tag == address / c->num_lines) {
+        update_access_time(c, line_index);
+    } else {
+        c->lines[line_index].valid = 1;
+        c->lines[line_index].tag = address / c->num_lines;
+        update_access_time(c, line_index);
+
     }
 }
 
-void access_cache(Cache *cache, int addr) {
-    int set_index = (addr / cache->block_size) % cache->num_sets;
-    int tag = (addr / cache->block_size) / cache->num_sets;
-    int i, j, lru_index, random_index;
-    int found = 0;
-    
-    for (i = 0; i < cache->assoc; i++) {
-        if (cache->valid[set_index][i] && cache->tag[set_index][i] == tag) {
-            cache->hit++;
-            if (cache->rp == 0) {
-                cache->lru[set_index] = i;
+// Function to access memory address in set-associative cache
+void access_set_assoc(cache* c, int address, int num_ways, int evict_policy) {
+    int set_index = address % (c->num_lines / num_ways);
+    int tag = address / (c->num_lines / num_ways);
+    int line_index = find_cache_line(c, set_index, tag);
+    if (line_index != -1) {
+        update_access_time(c, line_index);
+        printf("Cache hit!\n");
+    } else {
+        int i;
+        for (i = 0; i < num_ways; i++) {
+            int index = set_index * c->line_size + i;
+            if (!c->lines[index].valid) {
+                line_index = index;
+                break;
             }
-            found = 1;
-            break;
         }
-    }
-
-    if (!found) {
-        cache->miss++;
-        if (cache->rp == 0) {
-            lru_index = cache->lru[set_index];
-            for (i = 0; i < cache->assoc; i++) {
-                if (!cache->valid[set_index][i]) {
-                    lru_index = i;
-                    break;
-                }
-                if (cache->lru[set_index] > cache->lru[set_index + i]) {
-                    lru_index = i;
-                }
+        if (line_index == -1) {
+            if (evict_policy == 0) {
+                evict_lru_line(c, set_index);
+            } else {
+                evict_random_line(c, set_index);
             }
-            cache->lru[set_index] = cache->lru[set_index] + 1;
-            if (lru_index == cache->assoc) {
-                lru_index = 0;
-                cache->lru[set_index] = 0;
-            }
-            cache->tag[set_index][lru_index] = tag;
-            cache->valid[set_index][lru_index] = 1;
-            memcpy(&cache->data[set_index][lru_index * cache->block_size], &addr, cache->block_size * sizeof(char));
-        } else {
-            random_index = rand() % cache->assoc;
-            cache->tag[set_index][random_index] = tag;
-            cache->valid[set_index][random_index] = 1;
-            memcpy(&cache->data[set_index][random_index * cache->block_size], &addr, cache->block_size * sizeof(char));
+            line_index = set_index * c->line_size + (rand() % num_ways);
         }
+        c->lines[line_index].valid = 1;
+        c->lines[line_index].tag = tag;
+        update_access_time(c, line_index);
+        printf("Cache miss!\n");
     }
 }
+
+// Function to access memory address in fully associative cache
+void access_fully_assoc(cache* c, int address, int evict_policy) {
+    int line_index = find_cache_line_fully(c, address);
+    if (line_index != -1) {
+        update_access_time(c, line_index);
+    } else {
+        int i;
+        for (i = 0; i < c->num_lines; i++) {
+            if (!c->lines[i].valid) {
+                line_index = i;
+                break;
+            }
+        }
+        if (line_index == -1) {
+            if (evict_policy == 0) {
+                evict_lru_line_fully(c);
+            } else {
+                evict_random_line_fully(c);
+            }
+            line_index = rand() % c->num_lines;
+        }
+        c->lines[line_index].valid = 1;
+        c->lines[line_index].tag = address;
+        update_access_time(c, line_index);
+    }
+}
+#define CACHE_SIZE 8
+#define LINE_SIZE 2
+#define NUM_WAYS 2
 
 int main() {
-Cache cache;
-char hex[9];
-int addr;
-int i;
-// Initialize cache with size 32, associativity 1, block size 4, and replacement policy LRU
-cache.size = CACHE_SIZE;
-cache.block_size = BLOCK_SIZE;
-init_cache(&cache, 1, 0);
+    // Initialize cache
+    cache* c = (cache*) malloc(sizeof(cache));
+    c->size = CACHE_SIZE;
+    c->line_size = LINE_SIZE;
+    c->num_lines = CACHE_SIZE / LINE_SIZE;
+    c->lines = (cache_line*) malloc(CACHE_SIZE * sizeof(cache_line));
+    memset(c->lines, 0, CACHE_SIZE * sizeof(cache_line));
 
-// Open the file for reading
-    FILE *fp;
-    fp = fopen("traces.txt", "r");
-    if (fp == NULL) {
-        printf("Error opening file.\n");
+    // Initialize variables for hit rate calculation
+    int hits = 0;
+    int accesses = 0;
+    double hit_rate = 0.0;
+
+    // Open file for reading
+    FILE* file = fopen("traces.txt", "r");
+    if (file == NULL) {
+        printf("Error opening file\n");
         return 1;
     }
 
-// Access addresses in a loop
-for (i = 0; i < 16; i++) {
-    // Read hexadecimal address from input
-    scanf("%s", hex);
-    // Convert hexadecimal address to integer
-    addr = hex_to_int(hex);
-    // Access the cache using the address
-    access_cache(&cache, addr);
-}
-// Close the file
-    fclose(fp);
+    // Read file line by line
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        // Parse memory address from line
+        int address;
+        sscanf(line, "%x", &address);
 
-// Print cache statistics
-printf("Hits: %d\n", cache.hit);
-printf("Misses: %d\n", cache.miss);
+        // Access memory address in cache
+        access_set_assoc(c, address, NUM_WAYS, 0);
 
-return 0;
+        // Update hit rate calculation variables
+        if (strstr(line, "hit") != NULL) {
+            hits++;
+        }
+        accesses++;
+    }
+
+    // Calculate hit rate
+    if (accesses > 0) {
+        hit_rate = (double)hits / (double)accesses;
+    }
+        
+
+    //Print out results
+    printf("Hits: %d\n", hits);
+    printf("Total accesses: %d\n", accesses);
+    printf("Hit rate: %.2f\n", hit_rate);
+
+    // Free memory and close file
+    free(c->lines);
+    free(c);
+    fclose(file);
+
+    return 0;
 }
